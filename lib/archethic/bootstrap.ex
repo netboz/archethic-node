@@ -3,22 +3,12 @@ defmodule Archethic.Bootstrap do
   Manage Archethic Node Bootstrapping
   """
 
-  alias Archethic.Bootstrap.{
-    NetworkInit,
-    Sync,
-    TransactionHandler
-  }
+  alias Archethic
+  alias Archethic.{Bootstrap, Crypto, Networking, P2P, P2P.Node}
+  alias Archethic.{SelfRepair, SelfRepair, TransactionChain}
 
-  alias Archethic.{
-    Crypto,
-    Networking,
-    P2P,
-    P2P.Node,
-    P2P.Listener,
-    SelfRepair,
-    TransactionChain,
-    Replication
-  }
+  alias Bootstrap.{NetworkInit, Sync, TransactionHandler}
+  alias TransactionChain.{Transaction, TransactionData}
 
   require Logger
 
@@ -61,10 +51,6 @@ defmodule Archethic.Bootstrap do
       last_sync_date,
       reward_address
     ])
-  end
-
-  def done?() do
-    :persistent_term.get(:archethic_up, nil) == :up
   end
 
   @doc """
@@ -151,7 +137,7 @@ defmodule Archethic.Bootstrap do
          transport,
          bootstrapping_seeds,
          network_patch,
-         reward_address
+         configured_reward_address
        ) do
     Logger.info("Bootstrapping starting")
 
@@ -166,7 +152,7 @@ defmodule Archethic.Bootstrap do
             port,
             http_port,
             transport,
-            reward_address
+            configured_reward_address
           )
 
         Sync.initialize_network(tx)
@@ -184,13 +170,21 @@ defmodule Archethic.Bootstrap do
           transport,
           network_patch,
           bootstrapping_seeds,
-          reward_address
+          configured_reward_address
         )
 
         post_bootstrap(sync?: true)
 
       true ->
         Logger.info("Update node chain...")
+
+        {:ok, %Transaction{data: %TransactionData{content: content}}} =
+          TransactionChain.get_last_transaction(
+            Crypto.derive_address(Crypto.first_node_public_key())
+          )
+
+        {:ok, _ip, _p2p_port, _http_port, _transport, last_reward_address, _origin_public_key,
+         _key_certificate} = Node.decode_transaction_content(content)
 
         update_node(
           ip,
@@ -199,7 +193,7 @@ defmodule Archethic.Bootstrap do
           transport,
           network_patch,
           bootstrapping_seeds,
-          reward_address
+          last_reward_address
         )
 
         post_bootstrap(sync?: true)
@@ -209,6 +203,8 @@ defmodule Archethic.Bootstrap do
   defp post_bootstrap(opts) do
     if Keyword.get(opts, :sync?, true) do
       Logger.info("Synchronization started")
+      # Always load the current node list to have the current view for downloading transaction
+      :ok = Sync.load_node_list()
       :ok = SelfRepair.bootstrap_sync(SelfRepair.last_sync_date())
       Logger.info("Synchronization finished")
     end
@@ -220,8 +216,7 @@ defmodule Archethic.Bootstrap do
     SelfRepair.start_scheduler()
 
     :persistent_term.put(:archethic_up, :up)
-    Archethic.PubSub.notify_node_up()
-    Listener.listen()
+    Archethic.PubSub.notify_node_status(:node_up)
   end
 
   def resync_network_chain() do
@@ -235,52 +230,10 @@ defmodule Archethic.Bootstrap do
           &(&1.first_public_key == Crypto.first_node_public_key())
         )
 
+      # blocking code
       [:oracle, :node_shared_secrets, :reward]
-      |> Enum.each(&do_resync_network_chain(&1, nodes))
+      |> Enum.each(&SelfRepair.resync_network_chain(&1, nodes))
     end
-  end
-
-  @spec do_resync_network_chain(list(atom), list(P2P.Node.t()) | []) :: :ok
-  def do_resync_network_chain(_type_list, _nodes = []),
-    do: Logger.info("Enforce Reync of Network Txs: failure, No-Nodes")
-
-  # by type: Get gen addr, get last address (remotely  & locally)
-  # compare, if dont match, fetch last tx remotely
-  def do_resync_network_chain(type, nodes) when is_list(nodes) do
-    with addr when is_binary(addr) <- get_genesis_addr(type),
-         {:ok, rem_last_addr} <- TransactionChain.resolve_last_address(addr),
-         {local_last_addr, _} <- TransactionChain.get_last_address(addr),
-         false <- rem_last_addr == local_last_addr,
-         {:ok, tx} <- TransactionChain.fetch_transaction_remotely(rem_last_addr, nodes),
-         :ok <- Replication.validate_and_store_transaction_chain(tx) do
-      Logger.info("Enforced Resync: Success", transaction_type: type)
-      :ok
-    else
-      true ->
-        Logger.info("Enforced Resync: No new transaction to sync", transaction_type: type)
-        :ok
-
-      e when e in [nil, []] ->
-        Logger.debug("Enforced Resync: Transaction not available", transaction_type: type)
-        :ok
-
-      e ->
-        Logger.debug("Enforced Resync: Unexpected Error", transaction_type: type)
-        Logger.debug(e)
-    end
-  end
-
-  @spec get_genesis_addr(:node_shared_secrets | :oracle | :reward) :: binary() | nil
-  defp get_genesis_addr(:oracle) do
-    Archethic.OracleChain.genesis_address().current |> elem(0)
-  end
-
-  defp get_genesis_addr(:node_shared_secrets) do
-    Archethic.SharedSecrets.genesis_address(:node_shared_secrets)
-  end
-
-  defp get_genesis_addr(:reward) do
-    Archethic.Reward.genesis_address()
   end
 
   defp first_initialization(
@@ -290,7 +243,7 @@ defmodule Archethic.Bootstrap do
          transport,
          patch,
          bootstrapping_seeds,
-         reward_address
+         configured_reward_address
        ) do
     Enum.each(bootstrapping_seeds, &P2P.add_and_connect_node/1)
 
@@ -308,13 +261,29 @@ defmodule Archethic.Bootstrap do
 
     Crypto.set_node_key_index(length)
 
+    reward_address =
+      if length > 0 do
+        {:ok, last_address} =
+          Crypto.derive_address(Crypto.first_node_public_key())
+          |> TransactionChain.fetch_last_address_remotely(closest_nodes)
+
+        {:ok, %Transaction{data: %TransactionData{content: content}}} =
+          TransactionChain.fetch_transaction_remotely(last_address, closest_nodes)
+
+        {:ok, _ip, _p2p_port, _http_port, _transport, last_reward_address, _origin_public_key,
+         _key_certificate} = Node.decode_transaction_content(content)
+
+        last_reward_address
+      else
+        configured_reward_address
+      end
+
     tx =
       TransactionHandler.create_node_transaction(ip, port, http_port, transport, reward_address)
 
     :ok = TransactionHandler.send_transaction(tx, closest_nodes)
 
     :ok = Sync.load_storage_nonce(closest_nodes)
-    :ok = Sync.load_node_list(closest_nodes)
   end
 
   defp update_node(ip, port, http_port, transport, patch, bootstrapping_seeds, reward_address) do

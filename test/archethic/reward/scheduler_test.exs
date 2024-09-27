@@ -1,19 +1,23 @@
 defmodule Archethic.Reward.SchedulerTest do
   use ArchethicCase, async: false
 
-  alias Archethic.{
-    Crypto,
-    P2P,
-    P2P.Node,
-    P2P.Message.StartMining,
-    Reward.Scheduler,
-    TransactionChain.Transaction
-  }
+  alias Archethic.{Crypto, P2P, P2P.Node, P2P.Message.StartMining}
+  alias Archethic.{Reward.Scheduler, TransactionChain.Transaction}
+
+  import ArchethicCase, only: [setup_before_send_tx: 0]
 
   import Mox
 
+  setup do
+    setup_before_send_tx()
+
+    :ok
+  end
+
   describe "Trigger mint Reward" do
     test "should initiate the reward scheduler and trigger mint reward" do
+      :persistent_term.put(:archethic_up, nil)
+
       P2P.add_and_connect_node(%Node{
         first_public_key: Crypto.first_node_public_key(),
         last_public_key: Crypto.last_node_public_key(),
@@ -52,6 +56,8 @@ defmodule Archethic.Reward.SchedulerTest do
 
   describe "Scheduler" do
     setup do
+      :persistent_term.put(:archethic_up, nil)
+
       P2P.add_and_connect_node(%Node{
         first_public_key: Crypto.first_node_public_key(),
         last_public_key: Crypto.last_node_public_key(),
@@ -119,7 +125,7 @@ defmodule Archethic.Reward.SchedulerTest do
       assert {:idle, %{interval: "*/1 * * * * *"}} = :sys.get_state(pid)
     end
 
-    test "should wait for node :up message to start the scheduler, when node is not authorized and available" do
+    test "should wait for :node_up message to start the scheduler, when node is not authorized and available" do
       :persistent_term.put(:archethic_up, nil)
 
       {:ok, pid} = Scheduler.start_link([interval: "*/2 * * * * *"], [])
@@ -131,7 +137,9 @@ defmodule Archethic.Reward.SchedulerTest do
       assert {:idle, %{interval: "*/2 * * * * *"}} = :sys.get_state(pid)
     end
 
-    test "should wait for node :up message to start the scheduler, when node is authorized and available" do
+    test "should wait for :node_up message to start the scheduler, when node is authorized and available" do
+      :persistent_term.put(:archethic_up, nil)
+
       P2P.add_and_connect_node(%Node{
         ip: {127, 0, 0, 1},
         port: 3002,
@@ -153,6 +161,38 @@ defmodule Archethic.Reward.SchedulerTest do
                 interval: "*/3 * * * * *",
                 index: _,
                 next_address: _
+              }} = :sys.get_state(pid)
+    end
+
+    test "should wait for :node_down message to stop the scheduler" do
+      P2P.add_and_connect_node(%Node{
+        ip: {127, 0, 0, 1},
+        port: 3002,
+        first_public_key: Crypto.first_node_public_key(),
+        last_public_key: Crypto.first_node_public_key(),
+        authorized?: true,
+        authorization_date: DateTime.utc_now(),
+        geo_patch: "AAA",
+        available?: true
+      })
+
+      {:ok, pid} = Scheduler.start_link([interval: "*/3 * * * * *"], [])
+
+      assert {:idle, %{interval: "*/3 * * * * *"}} = :sys.get_state(pid)
+      send(pid, :node_up)
+
+      assert {:scheduled,
+              %{
+                interval: "*/3 * * * * *",
+                index: _,
+                next_address: _
+              }} = :sys.get_state(pid)
+
+      send(pid, :node_down)
+
+      assert {:idle,
+              %{
+                interval: "*/3 * * * * *"
               }} = :sys.get_state(pid)
     end
 

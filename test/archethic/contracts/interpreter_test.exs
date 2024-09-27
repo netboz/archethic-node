@@ -3,75 +3,373 @@ defmodule Archethic.Contracts.InterpreterTest do
   use ArchethicCase
 
   alias Archethic.Contracts.Contract
-
   alias Archethic.Contracts.Interpreter
+  alias Archethic.ContractFactory
 
   alias Archethic.TransactionChain.Transaction
   alias Archethic.TransactionChain.TransactionData
 
   doctest Interpreter
 
-  describe "parse/1" do
-    test "should return an error if not conditions or triggers are defined" do
-      assert {:error, _} =
-               """
-               abc
-               """
-               |> Interpreter.parse()
+  describe "strict versionning" do
+    test "should return ok if version exists" do
+      assert {:ok, _} = Interpreter.parse(ContractFactory.valid_version1_contract())
+      assert {:ok, _} = Interpreter.parse(ContractFactory.valid_legacy_contract())
+    end
 
+    test "should return an error if version does not exist yet" do
+      code_v0 = ~s"""
+      @version 20
+      #{ContractFactory.valid_legacy_contract()}
+      """
+
+      code_v1 = ~s"""
+      @version 20
+      #{ContractFactory.valid_version1_contract(version_attribute: false)}
+      """
+
+      assert {:error, "@version not supported"} = Interpreter.parse(code_v0)
+      assert {:error, "@version not supported"} = Interpreter.parse(code_v1)
+    end
+
+    test "should return an error if version is invalid" do
+      code_v0 = ~s"""
+      @version 1.5
+      #{ContractFactory.valid_legacy_contract()}
+      """
+
+      assert {:error, "@version not supported"} = Interpreter.parse(code_v0)
+    end
+  end
+
+  describe "parse code v1" do
+    test "should return an error if there are unexpected terms" do
       assert {:error, _} =
                """
-               condition
+               @version 1
+               condition transaction: [
+                uco_transfers: List.size() > 0
+               ]
+
+               some_unexpected_code
+
+               actions triggered_by: transaction do
+                Contract.set_content "hello"
+               end
                """
                |> Interpreter.parse()
     end
 
-    test "should return an error for unexpected term" do
-      assert {:error, "unexpected term - @1 - L1"} = "@1" |> Interpreter.parse()
+    test "should return the contract if format is OK" do
+      assert {:ok, %Contract{}} =
+               """
+               @version 1
+               condition transaction: [
+                uco_transfers: List.size() > 0
+               ]
+
+               actions triggered_by: transaction do
+                Contract.set_content "hello"
+               end
+               """
+               |> Interpreter.parse()
     end
   end
 
-  test "ICO contract parsing" do
-    assert {:ok, _} =
-             """
-             condition inherit: [
-                token_transfers: size() == 1
-             ]
+  describe "parse code v0" do
+    test "should return an error if there are unexpected terms" do
+      assert {:error, _} =
+               """
+               condition transaction: [
+                uco_transfers: size() > 0
+               ]
 
-             condition transaction: [
-                 uco_transfers: size() > 0,
-                 timestamp: transaction.timestamp < 1665750161
-             ]
+               some_unexpected_code
 
-             actions triggered_by: transaction do
-                # Get the amount of uco send to this contract
-                  amount_send = transaction.uco_transfers[contract.address]
-                  if amount_send > 0 do
-                    # Convert UCO to the number of tokens to credit. Each UCO worth 10 token
-                    token_to_credit = amount_send * 10
+               actions triggered_by: transaction do
+                set_content "hello"
+               end
+               """
+               |> Interpreter.parse()
+    end
 
-                    # Send the new transaction
-                    add_token_transfer to: transaction.address, token_address: contract.address, amount: token_to_credit
-                 end
-             end
-             """
-             |> Interpreter.parse()
+    test "should return the contract if format is OK" do
+      assert {:ok, %Contract{}} =
+               """
+               condition transaction: [
+                uco_transfers: size() > 0
+               ]
+
+               actions triggered_by: transaction do
+                set_content "hello"
+               end
+               """
+               |> Interpreter.parse()
+    end
   end
 
-  test "schedule transfers parsing" do
-    assert {:ok, _} =
-             """
-             condition inherit: [
-               type: transfer,
-               uco_transfers: 
-                  %{ "0000D574D171A484F8DEAC2D61FC3F7CC984BEB52465D69B3B5F670090742CBF5CC" => 100000000 }
-             ]
+  describe "execute/3" do
+    test "should return a transaction if the contract is correct and there was a Contract.* call" do
+      code = """
+        @version 1
+        condition inherit: [
+          content: "hello"
+        ]
 
-             actions triggered_by: interval, at: "* * * * *" do
-               set_type transfer
-               add_uco_transfer to: "0000D574D171A484F8DEAC2D61FC3F7CC984BEB52465D69B3B5F670090742CBF5CC", amount: 100000000
-             end
-             """
-             |> Interpreter.parse()
+        condition transaction: []
+
+        actions triggered_by: transaction do
+          Contract.set_content "hello"
+        end
+      """
+
+      contract_tx = %Transaction{
+        type: :contract,
+        data: %TransactionData{
+          code: code
+        }
+      }
+
+      incoming_tx = %Transaction{
+        type: :transfer,
+        data: %TransactionData{}
+      }
+
+      assert {:ok, %Transaction{}} =
+               Interpreter.execute(
+                 :transaction,
+                 Contract.from_transaction!(contract_tx),
+                 incoming_tx
+               )
+    end
+
+    test "should return nil when the contract is correct but no Contract.* call" do
+      code = """
+        @version 1
+        condition inherit: [
+          content: "hello"
+        ]
+
+        condition transaction: []
+
+        actions triggered_by: transaction do
+          if false do
+            Contract.set_content "hello"
+          end
+        end
+      """
+
+      contract_tx = %Transaction{
+        type: :contract,
+        data: %TransactionData{
+          code: code
+        }
+      }
+
+      incoming_tx = %Transaction{
+        type: :transfer,
+        data: %TransactionData{}
+      }
+
+      assert {:ok, nil} =
+               Interpreter.execute(
+                 :transaction,
+                 Contract.from_transaction!(contract_tx),
+                 incoming_tx
+               )
+    end
+
+    test "should return inherit constraints error when condition inherit fails" do
+      code = """
+        @version 1
+        condition inherit: [
+          content: "hello",
+          type: "data"
+        ]
+
+        condition transaction: []
+
+        actions triggered_by: transaction do
+          Contract.set_content "hello"
+        end
+      """
+
+      contract_tx = %Transaction{
+        type: :contract,
+        data: %TransactionData{
+          code: code
+        }
+      }
+
+      incoming_tx = %Transaction{
+        type: :transfer,
+        data: %TransactionData{}
+      }
+
+      assert match?(
+               {:error, :invalid_inherit_constraints},
+               Interpreter.execute(
+                 :transaction,
+                 Contract.from_transaction!(contract_tx),
+                 incoming_tx
+               )
+             )
+    end
+
+    test "should return transaction constraints error when condition inherit fails" do
+      code = """
+        @version 1
+        condition inherit: [
+          content: true
+        ]
+
+        condition transaction: [
+          type: "data"
+        ]
+
+        actions triggered_by: transaction do
+          Contract.set_content "hello"
+        end
+      """
+
+      contract_tx = %Transaction{
+        type: :contract,
+        data: %TransactionData{
+          code: code
+        }
+      }
+
+      incoming_tx = %Transaction{
+        type: :transfer,
+        data: %TransactionData{}
+      }
+
+      assert match?(
+               {:error, :invalid_transaction_constraints},
+               Interpreter.execute(
+                 :transaction,
+                 Contract.from_transaction!(contract_tx),
+                 incoming_tx
+               )
+             )
+    end
+
+    test "should return oracle constraints error when condition oracle fails" do
+      code = """
+        @version 1
+        condition inherit: [
+          content: true
+        ]
+
+        condition oracle: [
+          type: "oracle",
+          address: false
+        ]
+
+        actions triggered_by: oracle do
+          Contract.set_content "hello"
+        end
+      """
+
+      contract_tx = %Transaction{
+        type: :contract,
+        data: %TransactionData{
+          code: code
+        }
+      }
+
+      oracle_tx = %Transaction{
+        type: :oracle,
+        data: %TransactionData{}
+      }
+
+      assert match?(
+               {:error, :invalid_oracle_constraints},
+               Interpreter.execute(
+                 :oracle,
+                 Contract.from_transaction!(contract_tx),
+                 oracle_tx
+               )
+             )
+    end
+
+    test "should be able to simulate a trigger: datetime" do
+      code = """
+        @version 1
+        condition inherit: [
+          content: "hello"
+        ]
+
+        actions triggered_by: datetime, at: 1678984136 do
+          Contract.set_content "hello"
+        end
+      """
+
+      contract_tx = %Transaction{
+        type: :contract,
+        data: %TransactionData{
+          code: code
+        }
+      }
+
+      assert {:ok, %Transaction{}} =
+               Interpreter.execute(
+                 {:datetime, ~U[2023-03-16 16:28:56Z]},
+                 Contract.from_transaction!(contract_tx),
+                 nil
+               )
+    end
+
+    test "should be able to simulate a trigger: interval" do
+      code = """
+        @version 1
+        condition inherit: [
+          content: "hello"
+        ]
+
+        actions triggered_by: interval, at: "* * * * *" do
+          Contract.set_content "hello"
+        end
+      """
+
+      contract_tx = %Transaction{
+        type: :contract,
+        data: %TransactionData{
+          code: code
+        }
+      }
+
+      assert {:ok, %Transaction{}} =
+               Interpreter.execute(
+                 {:interval, "* * * * *"},
+                 Contract.from_transaction!(contract_tx),
+                 nil
+               )
+    end
+
+    test "should be able to simulate a trigger: oracle" do
+      code = """
+        @version 1
+        condition inherit: [
+          content: "hello"
+        ]
+
+        condition oracle: []
+
+        actions triggered_by: oracle do
+          Contract.set_content "hello"
+        end
+      """
+
+      contract_tx = %Transaction{
+        type: :contract,
+        data: %TransactionData{
+          code: code
+        }
+      }
+
+      assert {:ok, %Transaction{}} =
+               Interpreter.execute(:oracle, Contract.from_transaction!(contract_tx), nil)
+    end
   end
 end

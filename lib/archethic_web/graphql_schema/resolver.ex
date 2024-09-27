@@ -8,6 +8,7 @@ defmodule ArchethicWeb.GraphQLSchema.Resolver do
   alias Archethic.P2P
 
   alias Archethic.BeaconChain
+  alias Archethic.BeaconChain.ReplicationAttestation
   alias Archethic.BeaconChain.SummaryAggregate
   alias Archethic.BeaconChain.Subset.P2PSampling
 
@@ -211,8 +212,15 @@ defmodule ArchethicWeb.GraphQLSchema.Resolver do
           end
 
         :eq ->
-          BeaconChain.fetch_and_aggregate_summaries(next_datetime_summary_time, authorized_nodes)
-          |> SummaryAggregate.aggregate()
+          {summary_aggregate, _} =
+            BeaconChain.fetch_and_aggregate_summaries(
+              next_datetime_summary_time,
+              authorized_nodes
+            )
+            |> SummaryAggregate.aggregate()
+            |> SummaryAggregate.filter_reached_threshold()
+
+          summary_aggregate
 
         :lt ->
           case BeaconChain.fetch_summaries_aggregate(next_datetime_summary_time, authorized_nodes) do
@@ -225,11 +233,17 @@ defmodule ArchethicWeb.GraphQLSchema.Resolver do
   end
 
   defp create_empty_beacon_summary_aggregate(transactions_list, datetime = %DateTime{}) do
+    attestations =
+      Enum.map(
+        transactions_list,
+        &%ReplicationAttestation{transaction_summary: &1, confirmations: []}
+      )
+
     %SummaryAggregate{
       summary_time: datetime,
       availability_adding_time: [],
       version: 1,
-      transaction_summaries: transactions_list,
+      replication_attestations: attestations,
       p2p_availabilities: %{}
     }
   end
@@ -316,16 +330,9 @@ defmodule ArchethicWeb.GraphQLSchema.Resolver do
   defp transform_node_availabilities(<<>>, acc), do: acc
 
   def nearest_endpoints(ip) do
-    geo_patch = P2P.get_geo_patch(ip)
-    nearest_nodes = P2P.nearest_nodes(P2P.authorized_and_available_nodes(), geo_patch)
-
-    Enum.map(
-      nearest_nodes,
-      &%{
-        ip: :inet.ntoa(&1.ip),
-        port: &1.http_port
-      }
-    )
+    P2P.authorized_and_available_nodes()
+    |> P2P.nearest_nodes(P2P.get_geo_patch(ip))
+    |> Enum.map(&%{ip: :inet.ntoa(&1.ip), port: &1.http_port})
   end
 
   def network_transactions(type, page) do

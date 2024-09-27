@@ -3,29 +3,31 @@ defmodule Archethic do
   Provides high level functions serving the API and the Explorer
   """
 
-  alias __MODULE__.Account
-  alias __MODULE__.BeaconChain
-  alias __MODULE__.Crypto
-  alias __MODULE__.Election
-  alias __MODULE__.P2P
-  alias __MODULE__.P2P.Node
-  alias __MODULE__.P2P.Message.Balance
-  alias __MODULE__.P2P.Message.GetBalance
-  alias __MODULE__.P2P.Message.GetCurrentSummaries
-  alias __MODULE__.P2P.Message.GetTransactionSummary
-  alias __MODULE__.P2P.Message.TransactionSummaryMessage
-  alias __MODULE__.P2P.Message.NewTransaction
-  alias __MODULE__.P2P.Message.NotFound
-  alias __MODULE__.P2P.Message.Ok
-  alias __MODULE__.P2P.Message.StartMining
-  alias __MODULE__.P2P.Message.TransactionSummaryList
+  alias Archethic.SharedSecrets
+  alias __MODULE__.{Account, BeaconChain, Crypto, Election, P2P, P2P.Node, P2P.Message}
+  alias __MODULE__.{SelfRepair, TransactionChain}
+  alias __MODULE__.Contracts.Interpreter
+  alias __MODULE__.Contracts.Contract
 
-  alias __MODULE__.TransactionChain
-  alias __MODULE__.TransactionChain.Transaction
-  alias __MODULE__.TransactionChain.TransactionInput
-  alias __MODULE__.TransactionChain.TransactionSummary
+  alias Message.{NewTransaction, NotFound, StartMining}
+  alias Message.{Balance, GetBalance, GetTransactionSummary}
+  alias Message.{StartMining, Ok, TransactionSummaryMessage}
+
+  alias TransactionChain.{
+    Transaction,
+    TransactionInput,
+    TransactionSummary
+  }
 
   require Logger
+
+  @doc """
+    Returns true if a node is up and false if it is down
+  """
+  @spec up? :: boolean()
+  def up?() do
+    :persistent_term.get(:archethic_up, nil) == :up
+  end
 
   @doc """
   Search a transaction by its address
@@ -61,26 +63,42 @@ defmodule Archethic do
         welcome_node_key \\ Crypto.first_node_public_key()
       ) do
     if P2P.authorized_and_available_node?() do
-      do_send_transaction(tx, welcome_node_key)
+      case SharedSecrets.verify_synchronization() do
+        :ok ->
+          do_send_transaction(tx, welcome_node_key)
+
+        :error ->
+          forward_transaction(tx, welcome_node_key)
+
+        {:error, last_address_to_sync} ->
+          SelfRepair.resync(last_address_to_sync)
+          forward_transaction(tx, welcome_node_key)
+      end
     else
-      P2P.authorized_and_available_nodes()
-      |> Enum.filter(&Node.locally_available?/1)
-      |> P2P.nearest_nodes()
-      |> forward_transaction(tx)
+      # node not authorized
+      forward_transaction(tx, welcome_node_key)
     end
   end
 
-  defp forward_transaction([node | rest], tx) do
-    case P2P.send_message(node, %NewTransaction{transaction: tx}) do
+  defp forward_transaction(
+         tx,
+         welcome_node_key,
+         nodes \\ P2P.authorized_and_available_nodes()
+         |> Enum.filter(&Node.locally_available?/1)
+         |> P2P.nearest_nodes()
+       )
+
+  defp forward_transaction(tx, welcome_node_key, [node | rest]) do
+    case P2P.send_message(node, %NewTransaction{transaction: tx, welcome_node: welcome_node_key}) do
       {:ok, %Ok{}} ->
         :ok
 
       {:error, _} ->
-        forward_transaction(rest, tx)
+        forward_transaction(tx, welcome_node_key, rest)
     end
   end
 
-  defp forward_transaction([], _), do: {:error, :network_issue}
+  defp forward_transaction(_, _, []), do: {:error, :network_issue}
 
   defp do_send_transaction(tx = %Transaction{type: tx_type}, welcome_node_key) do
     current_date = DateTime.utc_now()
@@ -90,7 +108,7 @@ defmodule Archethic do
     # If new nodes have been authorized, they only will be selected at the application date
     node_list = P2P.authorized_and_available_nodes(current_date)
 
-    storage_nodes = Election.chain_storage_nodes_with_type(tx.address, tx.type, node_list)
+    storage_nodes = Election.chain_storage_nodes(tx.address, node_list)
 
     validation_nodes =
       Election.validation_nodes(
@@ -291,6 +309,33 @@ defmodule Archethic do
   end
 
   @doc """
+  Parse the given transaction and return a contract if successful
+  """
+  @spec parse_contract(Transaction.t()) :: {:ok, Contract.t()} | {:error, String.t()}
+  defdelegate parse_contract(contract_tx),
+    to: Interpreter,
+    as: :parse_transaction
+
+  @doc """
+  Execute the contract in the given transaction.
+  We assume the contract is parse-able.
+  """
+  @spec execute_contract(
+          Contract.trigger_type(),
+          Contract.t(),
+          nil | Transaction.t()
+        ) ::
+          {:ok, nil | Transaction.t()}
+          | {:error,
+             :invalid_triggers_execution
+             | :invalid_transaction_constraints
+             | :invalid_oracle_constraints
+             | :invalid_inherit_constraints}
+  defdelegate execute_contract(trigger_type, contract, maybe_tx),
+    to: Interpreter,
+    as: :execute
+
+  @doc """
   Retrieve the number of transaction in a transaction chain from the closest nodes
   """
   @spec get_transaction_chain_length(binary()) ::
@@ -347,43 +392,11 @@ defmodule Archethic do
     end
   end
 
-  @doc """
-  Slots which are already has been added
-  Real time transaction can be get from pubsub
-  """
-  @spec list_transactions_summaries_from_current_slot(DateTime.t()) ::
-          list(TransactionSummary.t())
-  def list_transactions_summaries_from_current_slot(date = %DateTime{} \\ DateTime.utc_now()) do
-    authorized_nodes = P2P.authorized_and_available_nodes()
+  defdelegate list_transactions_summaries_from_current_slot(),
+    to: BeaconChain
 
-    ref_time = DateTime.truncate(date, :millisecond)
-
-    next_summary_date = BeaconChain.next_summary_date(ref_time)
-
-    BeaconChain.list_subsets()
-    |> Flow.from_enumerable(stages: 256)
-    |> Flow.flat_map(fn subset ->
-      # Foreach subset and date we compute concurrently the node election
-      subset
-      |> Election.beacon_storage_nodes(next_summary_date, authorized_nodes)
-      |> Enum.filter(&Node.locally_available?/1)
-      |> P2P.nearest_nodes()
-      |> Enum.take(3)
-      |> Enum.map(&{&1, subset})
-    end)
-    # We partition by node
-    |> Flow.partition(key: {:elem, 0})
-    |> Flow.reduce(fn -> %{} end, fn {node, subset}, acc ->
-      # We aggregate the subsets for a given node
-      Map.update(acc, node, [subset], &[subset | &1])
-    end)
-    |> Flow.flat_map(fn {node, subsets} ->
-      # For this node we fetch the summaries
-      fetch_summaries(node, subsets)
-    end)
-    |> Stream.uniq_by(& &1.address)
-    |> Enum.sort_by(& &1.timestamp, {:desc, DateTime})
-  end
+  defdelegate list_transactions_summaries_from_current_slot(date),
+    to: BeaconChain
 
   @doc """
   Check if a transaction exists at address
@@ -423,22 +436,5 @@ defmodule Archethic do
           raise e
       end
     end
-  end
-
-  defp fetch_summaries(node, subsets) do
-    subsets
-    |> Stream.chunk_every(10)
-    |> Task.async_stream(fn subsets ->
-      case P2P.send_message(node, %GetCurrentSummaries{subsets: subsets}) do
-        {:ok, %TransactionSummaryList{transaction_summaries: transaction_summaries}} ->
-          transaction_summaries
-
-        _ ->
-          []
-      end
-    end)
-    |> Stream.filter(&match?({:ok, _}, &1))
-    |> Stream.flat_map(&elem(&1, 1))
-    |> Enum.to_list()
   end
 end

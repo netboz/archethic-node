@@ -6,6 +6,7 @@ defmodule Archethic.BeaconChainTest do
   alias Archethic.BeaconChain.Slot
   alias Archethic.BeaconChain.Slot.EndOfNodeSync
   alias Archethic.BeaconChain.SlotTimer
+  alias Archethic.BeaconChain.SummaryTimer
   alias Archethic.BeaconChain.Subset
   alias Archethic.BeaconChain.Subset.SummaryCache
   alias Archethic.BeaconChain.SubsetRegistry
@@ -21,6 +22,8 @@ defmodule Archethic.BeaconChainTest do
   alias Archethic.P2P.Message.GetBeaconSummaries
   alias Archethic.P2P.Message.GetTransactionSummary
   alias Archethic.P2P.Message.BeaconSummaryList
+  alias Archethic.P2P.Message.GetCurrentSummaries
+  alias Archethic.P2P.Message.TransactionSummaryList
   alias Archethic.P2P.Node
 
   alias Archethic.TransactionChain.TransactionSummary
@@ -33,6 +36,7 @@ defmodule Archethic.BeaconChainTest do
 
   setup do
     start_supervised!({SlotTimer, interval: "0 0 * * * *"})
+    start_supervised!({SummaryTimer, interval: "0 0 * * * *"})
     Enum.map(BeaconChain.list_subsets(), &start_supervised({Subset, subset: &1}, id: &1))
     Enum.each(BeaconChain.list_subsets(), &Subset.start_link(subset: &1))
     :ok
@@ -67,7 +71,6 @@ defmodule Archethic.BeaconChainTest do
 
   describe "load_slot/1" do
     test "should fetch the transaction chain from the beacon involved nodes" do
-      SummaryTimer.start_link([interval: "0 0 * * * * *"], [])
       SummaryCache.start_link()
       File.mkdir_p!(Utils.mut_dir())
 
@@ -186,15 +189,11 @@ defmodule Archethic.BeaconChainTest do
         address: addr1,
         timestamp: DateTime.utc_now(),
         type: :transfer,
-        fee: 100_000_000
+        fee: 100_000_000,
+        validation_stamp_checksum: :crypto.strong_rand_bytes(32)
       }
 
-      storage_nodes =
-        Election.chain_storage_nodes_with_type(
-          addr1,
-          :transfer,
-          P2P.authorized_and_available_nodes()
-        )
+      nodes = P2P.authorized_and_available_nodes() |> Enum.sort_by(& &1.first_public_key)
 
       beacon_summary = %Summary{
         subset: "A",
@@ -206,7 +205,7 @@ defmodule Archethic.BeaconChainTest do
               [node1, node2, node3, node4]
               |> Enum.with_index(1)
               |> Enum.map(fn {node, index} ->
-                node_index = Enum.find_index(storage_nodes, &(&1 == node))
+                node_index = Enum.find_index(nodes, &(&1 == node))
                 {_, pv} = Crypto.derive_keypair("node_seed", index)
                 {node_index, Crypto.sign(TransactionSummary.serialize(tx_summary), pv)}
               end)
@@ -223,13 +222,14 @@ defmodule Archethic.BeaconChainTest do
           {:ok, tx_summary}
       end)
 
-      %SummaryAggregate{transaction_summaries: transaction_summaries} =
+      %SummaryAggregate{replication_attestations: attestations} =
         BeaconChain.fetch_and_aggregate_summaries(
           summary_time,
           P2P.authorized_and_available_nodes()
         )
+        |> SummaryAggregate.aggregate()
 
-      assert [addr1] == Enum.map(transaction_summaries, & &1.address)
+      assert [addr1] == Enum.map(attestations, & &1.transaction_summary.address)
     end
 
     test "should find other beacon summaries and aggregate missing summaries", %{
@@ -239,18 +239,14 @@ defmodule Archethic.BeaconChainTest do
       addr1 = <<0::8, 0::8, :crypto.strong_rand_bytes(32)::binary>>
       addr2 = <<0::8, 0::8, :crypto.strong_rand_bytes(32)::binary>>
 
-      storage_nodes =
-        Election.chain_storage_nodes_with_type(
-          addr1,
-          :transfer,
-          P2P.authorized_and_available_nodes()
-        )
+      storage_nodes = Election.chain_storage_nodes(addr1, P2P.authorized_and_available_nodes())
 
       tx_summary = %TransactionSummary{
         address: addr1,
         timestamp: DateTime.utc_now(),
         type: :transfer,
-        fee: 100_000_000
+        fee: 100_000_000,
+        validation_stamp_checksum: :crypto.strong_rand_bytes(32)
       }
 
       summary_v1 = %Summary{
@@ -291,7 +287,8 @@ defmodule Archethic.BeaconChainTest do
               address: addr2,
               timestamp: DateTime.utc_now(),
               type: :transfer,
-              fee: 100_000_000
+              fee: 100_000_000,
+              validation_stamp_checksum: :crypto.strong_rand_bytes(32)
             },
             confirmations:
               [node1, node2, node3, node4]
@@ -323,13 +320,14 @@ defmodule Archethic.BeaconChainTest do
           {:ok, tx_summary}
       end)
 
-      %SummaryAggregate{transaction_summaries: transaction_summaries} =
+      %SummaryAggregate{replication_attestations: attestations} =
         BeaconChain.fetch_and_aggregate_summaries(
           summary_time,
           P2P.authorized_and_available_nodes()
         )
+        |> SummaryAggregate.aggregate()
 
-      transaction_addresses = Enum.map(transaction_summaries, & &1.address)
+      transaction_addresses = Enum.map(attestations, & &1.transaction_summary.address)
 
       assert Enum.all?(transaction_addresses, &(&1 in [addr1, addr2]))
     end
@@ -418,17 +416,9 @@ defmodule Archethic.BeaconChainTest do
                  summary_time,
                  P2P.authorized_and_available_nodes()
                )
+               |> SummaryAggregate.aggregate()
 
-      expected_availabilities =
-        [summary_v1, summary_v2, summary_v3, summary_v4]
-        |> Enum.map(& &1.node_availabilities)
-        |> Enum.flat_map(&Utils.bitstring_to_integer_list/1)
-        |> Enum.sort()
-
-      assert node_availabilities
-             |> Enum.flat_map(& &1)
-             |> Enum.sort() ==
-               expected_availabilities
+      assert <<1::1, 1::1, 1::1>> == node_availabilities
     end
 
     test "should find other beacon summaries and accumulate node P2P avg availabilities", %{
@@ -514,17 +504,48 @@ defmodule Archethic.BeaconChainTest do
                  summary_time,
                  P2P.authorized_and_available_nodes()
                )
+               |> SummaryAggregate.aggregate()
 
-      expected_average_availabilities =
-        [summary_v1, summary_v2, summary_v3, summary_v4]
-        |> Enum.map(& &1.node_average_availabilities)
-        |> Enum.flat_map(& &1)
-        |> Enum.sort()
+      assert [0.925, 0.8, 0.925, 0.85] == node_average_availabilities
+    end
+  end
 
-      assert node_average_availabilities
-             |> Enum.flat_map(& &1)
-             |> Enum.sort() ==
-               expected_average_availabilities
+  describe "list_transactions_summaries_from_current_slot/0" do
+    test "should work" do
+      now = DateTime.utc_now()
+
+      P2P.add_and_connect_node(%Node{
+        ip: {127, 0, 0, 1},
+        port: 3000,
+        first_public_key: <<0::8, :crypto.strong_rand_bytes(32)::binary>>,
+        last_public_key: <<0::8, :crypto.strong_rand_bytes(32)::binary>>,
+        available?: true,
+        geo_patch: "AAA",
+        network_patch: "AAA",
+        authorized?: true,
+        authorization_date: now |> DateTime.add(-10)
+      })
+
+      MockClient
+      |> stub(:send_message, fn
+        _, %GetCurrentSummaries{}, _ ->
+          {:ok,
+           %TransactionSummaryList{
+             transaction_summaries: [
+               %TransactionSummary{
+                 address: <<0::8, 0::8, :crypto.strong_rand_bytes(32)::binary>>,
+                 timestamp: now
+               }
+             ]
+           }}
+      end)
+
+      summaries = BeaconChain.list_transactions_summaries_from_current_slot()
+
+      # there are 256 subsets, and we query the summaries 10 by 10
+      # so we call the GetCurrentSummaries 26 times
+      # each call to GetCurrentSummaries return a list of 1 transactionSummary (mock above)
+      assert length(summaries) == 26
     end
   end
 end

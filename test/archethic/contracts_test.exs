@@ -3,10 +3,6 @@ defmodule Archethic.ContractsTest do
 
   alias Archethic.Contracts
 
-  alias Archethic.Contracts.Contract
-  alias Archethic.Contracts.ContractConditions, as: Conditions
-  alias Archethic.Contracts.ContractConstants, as: Constants
-
   alias Archethic.TransactionChain.Transaction
   alias Archethic.TransactionChain.TransactionData
   alias Archethic.TransactionChain.TransactionData.Ledger
@@ -93,6 +89,8 @@ defmodule Archethic.ContractsTest do
         },
         type: transfer
       ]
+
+      condition transaction: []
 
       actions triggered_by: transaction do
         add_uco_transfer to: \"3265CCD78CD74984FAB3CC6984D30C8C82044EBBAB1A4FFFB683BDB2D8C5BCF9\", amount: 1000000000

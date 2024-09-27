@@ -111,8 +111,6 @@ defmodule Archethic.MixProject do
       {:rand_compat, "~> 0.0.3"},
       {:gen_state_machine, "~> 3.0"},
       {:retry, "~> 0.17"},
-      {:gen_stage, "~> 1.1"},
-      {:flow, "~> 1.2"},
       {:knigge, "~> 1.4"},
       {:ex_json_schema, "~> 0.9", override: true},
       {:pathex, "~> 2.4"},
@@ -120,12 +118,27 @@ defmodule Archethic.MixProject do
       {:castore, "~> 1.0", override: true},
       {:floki, "~> 0.33"},
       {:ex_cldr, "~> 2.7"},
-      {:ex_cldr_numbers, "~> 2.29"}
+      {:ex_cldr_numbers, "~> 2.29"},
+      {:git_diff, "~> 0.6.4"},
+
+      # Numbering
+      {:nx, "~> 0.5"},
+      {:exla, "~> 0.5"}
     ]
   end
 
   defp aliases do
     [
+      "check.updates": ["cmd mix hex.outdated --within-requirements || echo 'Updates available!'"],
+      compile: ["git_hooks.install", "compile"],
+      "dev.update_deps": [
+        "hex.outdated --within-requirements",
+        "deps.update --all --only",
+        "deps.clean --all --only",
+        "deps.get",
+        "deps.compile",
+        "hex.outdated --within-requirements"
+      ],
       # Intial developer Setup
       "dev.setup": ["deps.get", "cmd npm install --prefix assets"],
       # When Changes are not registered by compiler | any()

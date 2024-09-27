@@ -5,9 +5,7 @@ defmodule Archethic.Contracts do
   """
 
   alias __MODULE__.Contract
-  alias __MODULE__.ContractConditions, as: Conditions
   alias __MODULE__.ContractConstants, as: Constants
-  alias __MODULE__.ConditionInterpreter
   alias __MODULE__.Interpreter
   alias __MODULE__.Loader
   alias __MODULE__.TransactionLookup
@@ -19,100 +17,18 @@ defmodule Archethic.Contracts do
   alias Archethic.TransactionChain.Transaction
   alias Archethic.TransactionChain.TransactionData
 
+  alias Archethic.Contracts.ContractConstants, as: Constants
+
   require Logger
 
   @extended_mode? Mix.env() != :prod
 
-  @doc ~S"""
-  Parse a smart contract code and return its representation
-
-  ## Examples
-
-      iex> "
-      ...>    condition inherit: [
-      ...>       content: regex_match?(\"^(Mr.X: ){1}([0-9]+), (Mr.Y: ){1}([0-9])+$\"),
-      ...>       origin_family: biometric
-      ...>    ]
-      ...>
-      ...>    actions triggered_by: datetime, at: 1601039923 do
-      ...>      set_type hosting
-      ...>      set_content \"Mr.X: 10, Mr.Y: 8\"
-      ...>    end
-      ...> "
-      ...> |> Contracts.parse()
-      {:ok,
-        %Contract{
-          conditions: %{
-            inherit: %Conditions{
-              content: {:==, [line: 2], [
-                true,
-                {
-                  {:., [line: 2], [{:__aliases__, [alias: Archethic.Contracts.Interpreter.Library], [:Library]}, :regex_match?]},
-                  [line: 2],
-                  [{:get_in, [line: 2], [{:scope, [line: 2], nil}, ["next", "content"]]}, "^(Mr.X: ){1}([0-9]+), (Mr.Y: ){1}([0-9])+$"]
-                }
-              ]},
-              origin_family: :biometric
-            },
-            transaction: %Conditions{},
-            oracle: %Conditions{}
-          },
-          constants: %Constants{
-            contract: nil,
-            transaction: nil
-          },
-          triggers: %{
-            {:datetime, ~U[2020-09-25 13:18:43Z]} => {:__block__, [], [
-                {
-                  :=,
-                  [line: 7],
-                  [
-                    {:scope, [line: 7], nil},
-                    {:update_in, [line: 7], [{:scope, [line: 7], nil}, ["next_transaction"], {:&, [line: 7], [{{:., [line: 7], [{:__aliases__, [alias: Archethic.Contracts.Interpreter.TransactionStatements], [:TransactionStatements]}, :set_type]}, [line: 7], [{:&, [line: 7], [1]}, "hosting"]}]}]}
-                  ]
-                },
-                {
-                  :=,
-                  [line: 8],
-                  [
-                    {:scope, [line: 8], nil},
-                    {:update_in, [line: 8], [{:scope, [line: 8], nil}, ["next_transaction"], {:&, [line: 8], [{{:., [line: 8], [{:__aliases__, [alias: Archethic.Contracts.Interpreter.TransactionStatements], [:TransactionStatements]}, :set_content]}, [line: 8], [{:&, [line: 8], [1]}, "Mr.X: 10, Mr.Y: 8"]}]}]}
-                  ]
-                }
-              ]},
-            }
-          }
-        }
+  @doc """
+  Parse a smart contract code and return a contract struct
   """
   @spec parse(binary()) :: {:ok, Contract.t()} | {:error, binary()}
-  def parse(contract_code) when is_binary(contract_code) do
-    start = System.monotonic_time()
-
-    case Interpreter.parse(contract_code) do
-      {:ok,
-       contract = %Contract{
-         triggers: triggers,
-         conditions: %{transaction: transaction_conditions, oracle: oracle_conditions}
-       }} ->
-        :telemetry.execute([:archethic, :contract, :parsing], %{
-          duration: System.monotonic_time() - start
-        })
-
-        cond do
-          Map.has_key?(triggers, :transaction) and Conditions.empty?(transaction_conditions) ->
-            {:error, "missing transaction conditions"}
-
-          Map.has_key?(triggers, :oracle) and Conditions.empty?(oracle_conditions) ->
-            {:error, "missing oracle conditions"}
-
-          true ->
-            {:ok, contract}
-        end
-
-      {:error, _} = e ->
-        e
-    end
-  end
+  defdelegate parse(contract_code),
+    to: Interpreter
 
   @doc """
   Same a `parse/1` but raise if the contract is not valid
@@ -134,7 +50,7 @@ defmodule Archethic.Contracts do
   Load transaction into the Smart Contract context leveraging the interpreter
   """
   @spec load_transaction(Transaction.t(), list()) :: :ok
-  defdelegate load_transaction(tx, opts \\ []), to: Loader
+  defdelegate load_transaction(tx, opts), to: Loader
 
   @spec accept_new_contract?(Transaction.t() | nil, Transaction.t(), DateTime.t()) :: boolean()
   def accept_new_contract?(nil, _, _), do: true
@@ -147,6 +63,7 @@ defmodule Archethic.Contracts do
       ) do
     {:ok,
      %Contract{
+       version: version,
        triggers: triggers,
        conditions: %{inherit: inherit_conditions}
      }} = Interpreter.parse(code)
@@ -156,7 +73,7 @@ defmodule Archethic.Contracts do
       "next" => Constants.from_transaction(next_tx)
     }
 
-    with :ok <- validate_conditions(inherit_conditions, constants),
+    with :ok <- validate_conditions(version, inherit_conditions, constants),
          :ok <- validate_triggers(triggers, next_tx, date) do
       true
     else
@@ -165,8 +82,8 @@ defmodule Archethic.Contracts do
     end
   end
 
-  defp validate_conditions(inherit_conditions, constants) do
-    if ConditionInterpreter.valid_conditions?(inherit_conditions, constants) do
+  defp validate_conditions(version, inherit_conditions, constants) do
+    if Interpreter.valid_conditions?(version, inherit_conditions, constants) do
       :ok
     else
       Logger.error("Inherit constraints not respected")

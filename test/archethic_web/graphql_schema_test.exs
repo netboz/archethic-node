@@ -4,41 +4,20 @@ defmodule ArchethicWeb.GraphQLSchemaTest do
   use ArchethicWeb.ConnCase
   use ArchethicWeb.GraphQLSubscriptionCase
 
-  alias Archethic.Crypto
+  alias Archethic.{Crypto, BeaconChain, P2P, TransactionChain, Mining, PubSub}
 
-  alias Archethic.BeaconChain.ReplicationAttestation
-  alias Archethic.BeaconChain.SummaryTimer
-  alias Archethic.BeaconChain.SummaryAggregate
+  alias BeaconChain.{ReplicationAttestation, SummaryAggregate, SummaryTimer}
+  alias TransactionChain.{Transaction, TransactionData, TransactionData.Ownership}
+  alias TransactionChain.{TransactionInput, TransactionSummary, VersionedTransactionInput}
 
-  alias Archethic.P2P
-  alias Archethic.P2P.Message.GetTransactionChainLength
-  alias Archethic.P2P.Message.TransactionChainLength
-  alias Archethic.P2P.Message.Balance
-  alias Archethic.P2P.Message.GenesisAddress
-  alias Archethic.P2P.Message.GetBalance
-  alias Archethic.P2P.Message.GetLastTransactionAddress
-  alias Archethic.P2P.Message.GetTransaction
-  alias Archethic.P2P.Message.GetTransactionChain
-  alias Archethic.P2P.Message.GetTransactionInputs
-  alias Archethic.P2P.Message.LastTransactionAddress
-  alias Archethic.P2P.Message.NotFound
-  alias Archethic.P2P.Message.TransactionInputList
-  alias Archethic.P2P.Message.TransactionList
-  alias Archethic.P2P.Message.GetGenesisAddress
-  alias Archethic.P2P.Message.GetBeaconSummariesAggregate
-  alias Archethic.P2P.Message.GetCurrentSummaries
-  alias Archethic.P2P.Node
+  alias P2P.{Node, Message}
+  alias Message.{GetTransactionChainLength, TransactionChainLength, Balance, GenesisAddress}
+  alias Message.{GetBalance, GetLastTransactionAddress, GetTransaction, NotFound}
+  alias Message.{GetTransactionChain, GetTransactionInputs, LastTransactionAddress}
+  alias Message.{TransactionInputList, TransactionList, GetGenesisAddress}
+  alias Message.{GetBeaconSummariesAggregate, GetCurrentSummaries}
 
-  alias Archethic.PubSub
-
-  alias Archethic.TransactionChain.Transaction
-  alias Archethic.TransactionChain.TransactionData
-  alias Archethic.TransactionChain.TransactionData.Ownership
-  alias Archethic.TransactionChain.TransactionInput
-  alias Archethic.TransactionChain.VersionedTransactionInput
-  alias Archethic.TransactionChain.TransactionSummary
-
-  alias Archethic.Mining
+  alias ArchethicWeb.GraphQLSchema.Resolver
 
   import Mox
   @transaction_chain_page_size 10
@@ -772,38 +751,40 @@ defmodule ArchethicWeb.GraphQLSchemaTest do
         |> DateTime.add(-1, :day)
         |> DateTime.to_unix()
 
-      transaction_summaries = [
-        %TransactionSummary{
-          timestamp: ~U[2022-12-06 23:56:00.006Z],
-          address:
-            <<0, 0, 206, 240, 245, 203, 197, 124, 94, 244, 159, 116, 250, 33, 156, 45, 76, 218,
-              205, 36, 102, 210, 113, 143, 12, 21, 228, 164, 14, 115, 91, 21, 80, 247>>,
-          type: :oracle_summary,
-          fee: 0,
-          movements_addresses: []
-        },
-        %TransactionSummary{
-          timestamp: ~U[2022-12-06 23:56:00.042Z],
-          address:
-            <<0, 0, 93, 87, 204, 21, 164, 60, 42, 148, 90, 78, 173, 11, 77, 189, 104, 15, 120, 6,
-              54, 35, 203, 176, 246, 200, 100, 215, 101, 150, 29, 59, 225, 65>>,
-          type: :oracle,
-          fee: 0,
-          movements_addresses: []
-        },
-        %TransactionSummary{
-          timestamp: ~U[2022-12-06 23:56:30.865Z],
-          address:
-            <<0, 0, 234, 152, 107, 255, 80, 152, 50, 245, 184, 183, 134, 17, 162, 71, 41, 203, 94,
-              81, 174, 188, 75, 128, 218, 110, 53, 11, 68, 5, 242, 31, 191, 202>>,
-          type: :node_rewards,
-          fee: 0,
-          movements_addresses: [
-            <<0, 0, 238, 157, 220, 82, 41, 235, 255, 225, 151, 39, 112, 88, 241, 26, 65, 226, 34,
-              82, 216, 106, 144, 76, 140, 188, 243, 140, 30, 252, 66, 171, 80, 101>>
-          ]
-        }
-      ]
+      attestations =
+        [
+          %TransactionSummary{
+            timestamp: ~U[2022-12-06 23:56:00.006Z],
+            address:
+              <<0, 0, 206, 240, 245, 203, 197, 124, 94, 244, 159, 116, 250, 33, 156, 45, 76, 218,
+                205, 36, 102, 210, 113, 143, 12, 21, 228, 164, 14, 115, 91, 21, 80, 247>>,
+            type: :oracle_summary,
+            fee: 0,
+            movements_addresses: []
+          },
+          %TransactionSummary{
+            timestamp: ~U[2022-12-06 23:56:00.042Z],
+            address:
+              <<0, 0, 93, 87, 204, 21, 164, 60, 42, 148, 90, 78, 173, 11, 77, 189, 104, 15, 120,
+                6, 54, 35, 203, 176, 246, 200, 100, 215, 101, 150, 29, 59, 225, 65>>,
+            type: :oracle,
+            fee: 0,
+            movements_addresses: []
+          },
+          %TransactionSummary{
+            timestamp: ~U[2022-12-06 23:56:30.865Z],
+            address:
+              <<0, 0, 234, 152, 107, 255, 80, 152, 50, 245, 184, 183, 134, 17, 162, 71, 41, 203,
+                94, 81, 174, 188, 75, 128, 218, 110, 53, 11, 68, 5, 242, 31, 191, 202>>,
+            type: :node_rewards,
+            fee: 0,
+            movements_addresses: [
+              <<0, 0, 238, 157, 220, 82, 41, 235, 255, 225, 151, 39, 112, 88, 241, 26, 65, 226,
+                34, 82, 216, 106, 144, 76, 140, 188, 243, 140, 30, 252, 66, 171, 80, 101>>
+            ]
+          }
+        ]
+        |> Enum.map(&%ReplicationAttestation{transaction_summary: &1, confirmations: []})
 
       str_filtered_transaction_summaries = %{
         "data" => %{
@@ -827,7 +808,7 @@ defmodule ArchethicWeb.GraphQLSchemaTest do
       MockClient
       |> expect(:send_message, fn
         _, %GetBeaconSummariesAggregate{}, _ ->
-          {:ok, %SummaryAggregate{transaction_summaries: transaction_summaries}}
+          {:ok, %SummaryAggregate{replication_attestations: attestations}}
       end)
 
       conn =
@@ -856,6 +837,7 @@ defmodule ArchethicWeb.GraphQLSchemaTest do
       P2P.add_and_connect_node(%Node{
         ip: {127, 0, 0, 1},
         port: 3004,
+        http_port: 3004,
         first_public_key: <<0::8, 0::8, 1::8, :crypto.strong_rand_bytes(31)::binary>>,
         last_public_key: "test",
         available?: true
@@ -865,6 +847,9 @@ defmodule ArchethicWeb.GraphQLSchemaTest do
       |> stub(:send_message, fn
         _, %GetCurrentSummaries{}, _ ->
           {:ok, []}
+
+        _, %GetBeaconSummariesAggregate{}, _ ->
+          {:ok, %SummaryAggregate{version: version}}
       end)
 
       conn =
@@ -921,5 +906,112 @@ defmodule ArchethicWeb.GraphQLSchemaTest do
     :persistent_term.put(:archethic_up, nil)
 
     assert_raise MatchError, fn -> get_socket() end
+  end
+
+  describe "Nearest Endpoint" do
+    test "order of return", %{conn: conn} do
+      P2P.add_and_connect_node(%Node{
+        ip: {101, 10, 10, 1},
+        port: 40_005,
+        http_port: 4005,
+        first_public_key: Crypto.first_node_public_key(),
+        last_public_key: "key2",
+        network_patch: "AAA",
+        geo_patch: "AAA",
+        available?: true,
+        authorized?: true,
+        authorization_date: DateTime.utc_now(),
+        enrollment_date: DateTime.utc_now()
+      })
+
+      P2P.add_and_connect_node(%Node{
+        ip: {100, 10, 10, 1},
+        port: 40_005,
+        http_port: 4005,
+        first_public_key: "key2",
+        last_public_key: "key2",
+        network_patch: "ABC",
+        geo_patch: "AAA",
+        available?: true,
+        authorized?: true,
+        authorization_date: DateTime.utc_now(),
+        enrollment_date: DateTime.utc_now()
+      })
+
+      P2P.add_and_connect_node(%Node{
+        ip: {99, 10, 10, 1},
+        port: 40_004,
+        http_port: 40_004,
+        first_public_key: "key1",
+        last_public_key: "key1",
+        network_patch: "E0A",
+        geo_patch: "AAA",
+        available?: true,
+        authorized?: true,
+        authorization_date: DateTime.utc_now(),
+        enrollment_date: DateTime.utc_now()
+      })
+
+      P2P.add_and_connect_node(%Node{
+        ip: {147, 190, 18, 11},
+        port: 40_004,
+        http_port: 40_004,
+        first_public_key: "key3",
+        last_public_key: "key3",
+        network_patch: "ABB",
+        geo_patch: "AAA",
+        available?: true,
+        authorized?: true,
+        authorization_date: DateTime.utc_now(),
+        enrollment_date: DateTime.utc_now()
+      })
+
+      MockGeoIP
+      |> stub(:get_coordinates, fn _ ->
+        {48.8583701, 2.2922926}
+      end)
+
+      ip = {98, 6, 2, 5}
+
+      assert [
+               %{ip: '101.10.10.1', port: 4_005},
+               %{ip: '100.10.10.1', port: 4_005},
+               %{
+                 ip: '147.190.18.11',
+                 port: 40_004
+               },
+               %{ip: '99.10.10.1', port: 40_004}
+             ] = Resolver.nearest_endpoints(ip)
+
+      conn = Map.put(conn, :remote_ip, ip)
+
+      conn =
+        post(conn, "/api", %{
+          "query" => "query { nearestEndpoints{ip,port} }"
+        })
+
+      %{
+        "data" => %{
+          "nearestEndpoints" => [
+            %{
+              "ip" => "101.10.10.1",
+              "port" => 4_005
+            },
+            %{
+              "ip" => "100.10.10.1",
+              "port" => 4_005
+            },
+            %{
+              "ip" => "147.190.18.11",
+              "port" => 40_004
+            },
+            %{
+              "ip" => "99.10.10.1",
+              "port" => 40_004
+            }
+          ]
+        }
+      } = json_response(conn, 200)
+    end
   end
 end

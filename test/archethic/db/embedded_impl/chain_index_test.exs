@@ -3,6 +3,7 @@ defmodule Archethic.DB.EmbeddedImpl.ChainIndexTest do
 
   alias Archethic.DB.EmbeddedImpl.ChainIndex
   alias Archethic.DB.EmbeddedImpl.ChainWriter
+  alias ArchethicCache.LRU
 
   setup do
     db_path = Application.app_dir(:archethic, "data_test")
@@ -38,16 +39,16 @@ defmodule Archethic.DB.EmbeddedImpl.ChainIndexTest do
     end
 
     test "should load transactions tables", %{db_path: db_path} do
-      {:ok, pid} = ChainIndex.start_link(path: db_path)
+      {:ok, _pid} = ChainIndex.start_link(path: db_path)
       tx_address = <<0::8, 0::8, :crypto.strong_rand_bytes(32)::binary>>
       genesis_address = <<0::8, 0::8, :crypto.strong_rand_bytes(32)::binary>>
 
       ChainIndex.add_tx(tx_address, genesis_address, 100, db_path)
       ChainIndex.set_last_chain_address(genesis_address, tx_address, DateTime.utc_now(), db_path)
 
-      GenServer.stop(pid)
+      # GenServer.stop(pid)
 
-      ChainIndex.start_link(path: db_path)
+      # ChainIndex.start_link(path: db_path)
 
       assert {:ok, %{genesis_address: ^genesis_address, size: 100}} =
                ChainIndex.get_tx_entry(tx_address, db_path)
@@ -57,7 +58,7 @@ defmodule Archethic.DB.EmbeddedImpl.ChainIndexTest do
       assert {^tx_address, _} = ChainIndex.get_last_chain_address(genesis_address, db_path)
 
       # Remove the transaction from the cache and try to fetch from the file instead
-      :ets.delete(:archethic_db_tx_index, tx_address)
+      LRU.purge(Archethic.Db.ChainIndex.LRU)
       assert true == ChainIndex.transaction_exists?(tx_address, db_path)
       assert false == ChainIndex.transaction_exists?(:crypto.strong_rand_bytes(32), db_path)
     end

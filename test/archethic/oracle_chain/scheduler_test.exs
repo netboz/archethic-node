@@ -18,10 +18,17 @@ defmodule Archethic.OracleChain.SchedulerTest do
   alias Archethic.TransactionChain.Transaction.ValidationStamp
   alias Archethic.TransactionChain.TransactionData
 
+  alias ArchethicCache.HydratingCache
+
+  import ArchethicCase, only: [setup_before_send_tx: 0]
+
   import Mox
 
   setup do
     SelfRepairScheduler.start_link([interval: "0 0 * * *"], [])
+
+    setup_before_send_tx()
+
     :ok
   end
 
@@ -102,26 +109,19 @@ defmodule Archethic.OracleChain.SchedulerTest do
 
       assert {:scheduled, _} = :sys.get_state(pid)
 
-      MockUCOPriceProvider1
-      |> expect(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
-
-      MockUCOPriceProvider2
-      |> expect(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
-
-      MockUCOPriceProvider3
-      |> expect(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
-
-      # polling_date =
-      #   "0 * * * *"
-      #   |> Crontab.CronExpression.Parser.parse!(true)
-      #   |> Crontab.Scheduler.get_next_run_date!(DateTime.to_naive(DateTime.utc_now()))
-      #   |> DateTime.from_naive!("Etc/UTC")
-
       summary_date =
         "0 0 0 * *"
         |> Crontab.CronExpression.Parser.parse!(true)
         |> Crontab.Scheduler.get_next_run_date!(DateTime.to_naive(DateTime.utc_now()))
         |> DateTime.from_naive!("Etc/UTC")
+
+      MockUCOPrice
+      |> expect(:fetch, fn ->
+        {:ok, %{usd: 0.2}}
+      end)
+      |> expect(:parse_data, fn _ ->
+        {:ok, %{usd: 0.2}}
+      end)
 
       send(pid, :poll)
 
@@ -164,6 +164,11 @@ defmodule Archethic.OracleChain.SchedulerTest do
         available?: true
       })
 
+      MockUCOPrice
+      |> expect(:fetch, fn ->
+        {:ok, %{usd: 0.2}}
+      end)
+
       MockDB
       |> expect(:get_transaction, fn _, _, _ ->
         {:ok,
@@ -179,15 +184,6 @@ defmodule Archethic.OracleChain.SchedulerTest do
            }
          }}
       end)
-
-      MockUCOPriceProvider1
-      |> expect(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
-
-      MockUCOPriceProvider2
-      |> expect(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
-
-      MockUCOPriceProvider3
-      |> expect(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
 
       send(pid, :poll)
 
@@ -218,27 +214,19 @@ defmodule Archethic.OracleChain.SchedulerTest do
         available?: true
       })
 
-      MockUCOPriceProvider1
-      |> expect(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
-
-      MockUCOPriceProvider2
-      |> expect(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
-
-      MockUCOPriceProvider3
-      |> expect(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
+      MockUCOPrice
+      |> expect(:fetch, fn ->
+        {:ok, %{usd: 0.2}}
+      end)
+      |> expect(:parse_data, fn _ ->
+        {:ok, %{usd: 0.2}}
+      end)
 
       summary_date =
         "0 0 0 * *"
         |> Crontab.CronExpression.Parser.parse!(true)
         |> Crontab.Scheduler.get_next_run_date!(DateTime.to_naive(DateTime.utc_now()))
         |> DateTime.from_naive!("Etc/UTC")
-
-      #  summary_date2 =
-      #    "0 0 0 * *"
-      #    |> Crontab.CronExpression.Parser.parse!(true)
-      #    |> Crontab.Scheduler.get_next_run_dates(DateTime.to_naive(DateTime.utc_now()))
-      #    |> Enum.at(1)
-      #    |> DateTime.from_naive!("Etc/UTC")
 
       MockDB
       |> expect(:get_transaction_chain, fn _, _, _ ->
@@ -293,11 +281,6 @@ defmodule Archethic.OracleChain.SchedulerTest do
                         data: %TransactionData{content: content}
                       }}
 
-      #      assert polling_address ==
-      #               Crypto.derive_oracle_keypair(summary_date2, 1)
-      #               |> elem(0)
-      #               |> Crypto.hash()
-      #
       assert {:ok, %{"uco" => %{"usd" => 0.2}}} = Services.parse_data(Jason.decode!(content))
     end
 
@@ -327,14 +310,10 @@ defmodule Archethic.OracleChain.SchedulerTest do
 
       assert {:scheduled, %{polling_timer: timer1}} = :sys.get_state(pid)
 
-      MockUCOPriceProvider1
-      |> stub(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
-
-      MockUCOPriceProvider2
-      |> stub(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
-
-      MockUCOPriceProvider3
-      |> stub(:fetch, fn _pairs -> {:ok, %{"usd" => [0.2]}} end)
+      MockUCOPrice
+      |> expect(:fetch, fn ->
+        {:ok, %{usd: 0.2}}
+      end)
 
       send(pid, :poll)
 
@@ -377,7 +356,9 @@ defmodule Archethic.OracleChain.SchedulerTest do
               }} = :sys.get_state(pid)
     end
 
-    test "should wait for node up message to start the scheduler, node: authorized and available" do
+    test "should wait for node up message to start the scheduler and node_down to stop the scheduler, node: authorized and available" do
+      :persistent_term.put(:archethic_up, nil)
+
       P2P.add_and_connect_node(%Node{
         ip: {127, 0, 0, 1},
         port: 3002,
@@ -403,6 +384,14 @@ defmodule Archethic.OracleChain.SchedulerTest do
                 polling_interval: "0 */3 * * *",
                 summary_interval: "0 0 0 * *",
                 summary_date: _date_time = %DateTime{}
+              }} = :sys.get_state(pid)
+
+      send(pid, :node_down)
+
+      assert {:idle,
+              %{
+                polling_interval: "0 */3 * * *",
+                summary_interval: "0 0 0 * *"
               }} = :sys.get_state(pid)
     end
 

@@ -2,22 +2,11 @@ defmodule Archethic.P2P do
   @moduledoc """
   Handle P2P node discovery and messaging
   """
-  alias Archethic.Crypto
+  alias Archethic.{Crypto, TaskSupervisor, TransactionChain}
 
-  alias __MODULE__.BootstrappingSeeds
-  alias __MODULE__.Client
-  alias __MODULE__.GeoPatch
-  alias __MODULE__.MemTable
-  alias __MODULE__.MemTableLoader
-  alias __MODULE__.Message
-  alias __MODULE__.Node
+  alias Archethic.{TransactionChain.Transaction, Utils}
 
-  alias Archethic.TaskSupervisor
-
-  alias Archethic.TransactionChain
-  alias Archethic.TransactionChain.Transaction
-
-  alias Archethic.Utils
+  alias __MODULE__.{BootstrappingSeeds, Client, GeoPatch, MemTable, MemTableLoader, Message, Node}
 
   require Logger
 
@@ -64,6 +53,12 @@ defmodule Archethic.P2P do
       :ok
     end
   end
+
+  @doc """
+  Reload last P2P view from DB
+  """
+  @spec reload_last_view(last_sync_date :: DateTime.t() | nil) :: :ok
+  defdelegate reload_last_view(last_sync_date), to: MemTableLoader, as: :load_p2p_view
 
   @doc """
   List the nodes registered.

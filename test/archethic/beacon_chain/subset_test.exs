@@ -28,6 +28,18 @@ defmodule Archethic.BeaconChain.SubsetTest do
   import Mox
 
   setup do
+    P2P.add_and_connect_node(%Node{
+      ip: {127, 0, 0, 1},
+      port: 3000,
+      first_public_key: Crypto.first_node_public_key(),
+      last_public_key: Crypto.first_node_public_key(),
+      geo_patch: "AAA",
+      network_patch: "AAA",
+      available?: true,
+      authorized?: true,
+      authorization_date: DateTime.utc_now() |> DateTime.add(-1)
+    })
+
     {:ok, subset: <<0>>}
   end
 
@@ -78,7 +90,8 @@ defmodule Archethic.BeaconChain.SubsetTest do
         address: tx_address,
         timestamp: tx_time,
         type: :node,
-        fee: 0
+        fee: 0,
+        validation_stamp_checksum: :crypto.strong_rand_bytes(32)
       }
 
       sig = Crypto.sign_with_last_node_key(TransactionSummary.serialize(tx_summary))
@@ -121,7 +134,8 @@ defmodule Archethic.BeaconChain.SubsetTest do
         address: tx_address,
         timestamp: tx_time,
         type: :node,
-        fee: 0
+        fee: 0,
+        validation_stamp_checksum: :crypto.strong_rand_bytes(32)
       }
 
       tx_summary_payload = TransactionSummary.serialize(tx_summary)
@@ -159,6 +173,75 @@ defmodule Archethic.BeaconChain.SubsetTest do
       assert Enum.count(confirmations) == 2
     end
 
+    test "new transaction summary's should be refused if it is too old",
+         %{subset: subset} do
+      MockClient
+      |> stub(:send_message, fn
+        _, %TransactionSummary{}, _ ->
+          {:ok, %Ok{}}
+
+        _, %NewBeaconSlot{}, _ ->
+          {:ok, %Ok{}}
+      end)
+
+      start_supervised!({SummaryTimer, interval: "0 0 * * *"})
+      start_supervised!({SlotTimer, interval: "0 */10 * * *"})
+      pid = start_supervised!({Subset, subset: subset})
+
+      # Tx from last summary should pass
+      tx_time = DateTime.utc_now() |> DateTime.add(-1, :hour)
+      tx_address = <<0::8, 0::8, subset::binary-size(1), :crypto.strong_rand_bytes(31)::binary>>
+
+      tx_summary = %TransactionSummary{
+        address: tx_address,
+        timestamp: tx_time,
+        type: :node,
+        fee: 0,
+        validation_stamp_checksum: :crypto.strong_rand_bytes(32)
+      }
+
+      sig = Crypto.sign_with_last_node_key(TransactionSummary.serialize(tx_summary))
+
+      send(
+        pid,
+        {:new_replication_attestation,
+         %ReplicationAttestation{transaction_summary: tx_summary, confirmations: [{0, sig}]}}
+      )
+
+      # Tx from 2 last summary should not pass
+      tx_time = DateTime.utc_now() |> DateTime.add(-2, :hour)
+      tx_address2 = <<0::8, 0::8, subset::binary-size(1), :crypto.strong_rand_bytes(31)::binary>>
+
+      tx_summary = %TransactionSummary{
+        address: tx_address2,
+        timestamp: tx_time,
+        type: :node,
+        fee: 0,
+        validation_stamp_checksum: :crypto.strong_rand_bytes(32)
+      }
+
+      sig2 = Crypto.sign_with_last_node_key(TransactionSummary.serialize(tx_summary))
+
+      send(
+        pid,
+        {:new_replication_attestation,
+         %ReplicationAttestation{transaction_summary: tx_summary, confirmations: [{0, sig2}]}}
+      )
+
+      assert %{
+               current_slot: %Slot{
+                 transaction_attestations: [
+                   %ReplicationAttestation{
+                     transaction_summary: %TransactionSummary{
+                       address: ^tx_address
+                     },
+                     confirmations: [{0, ^sig}]
+                   }
+                 ]
+               }
+             } = :sys.get_state(pid)
+    end
+
     test "new slot is created when receive a :create_slot message", %{subset: subset} do
       start_supervised!({SummaryTimer, interval: "0 0 * * *"})
       start_supervised!({SlotTimer, interval: "0 0 * * *"})
@@ -166,18 +249,6 @@ defmodule Archethic.BeaconChain.SubsetTest do
 
       tx_time = DateTime.utc_now()
       tx_address = <<0::8, 0::8, subset::binary-size(1), :crypto.strong_rand_bytes(31)::binary>>
-
-      P2P.add_and_connect_node(%Node{
-        ip: {127, 0, 0, 1},
-        port: 3000,
-        first_public_key: Crypto.first_node_public_key(),
-        last_public_key: Crypto.first_node_public_key(),
-        geo_patch: "AAA",
-        network_patch: "AAA",
-        available?: true,
-        authorized?: true,
-        authorization_date: DateTime.utc_now() |> DateTime.add(-1)
-      })
 
       P2P.add_and_connect_node(%Node{
         ip: {127, 0, 0, 1},
@@ -201,7 +272,8 @@ defmodule Archethic.BeaconChain.SubsetTest do
           <<0, 0, 8, 253, 201, 142, 182, 78, 169, 132, 29, 19, 74, 3, 142, 207, 219, 127, 147, 40,
             24, 44, 170, 214, 171, 224, 29, 177, 205, 226, 88, 62, 248, 84>>
         ],
-        fee: 0
+        fee: 0,
+        validation_stamp_checksum: :crypto.strong_rand_bytes(32)
       }
 
       tx_summary_payload = TransactionSummary.serialize(tx_summary)
@@ -252,16 +324,17 @@ defmodule Archethic.BeaconChain.SubsetTest do
         _, %Ping{}, _ ->
           {:ok, %Ok{}}
 
-        _, %NewBeaconSlot{}, _ ->
+        _, %NewBeaconSlot{slot: slot = %Slot{subset: subset}}, _ ->
+          SummaryCache.add_slot(subset, slot)
           {:ok, %Ok{}}
       end)
 
       MockClient
       |> stub(:get_availability_timer, fn _, _ -> 0 end)
 
-      summary_interval = "*/5 * * * *"
+      summary_interval = "*/3 * * * *"
       start_supervised!({SummaryTimer, interval: summary_interval})
-      start_supervised!({SlotTimer, interval: "0 0 * * *"})
+      start_supervised!({SlotTimer, interval: "*/1 * * * *"})
       start_supervised!(SummaryCache)
       File.mkdir_p!(Utils.mut_dir())
       pid = start_supervised!({Subset, subset: subset})
@@ -286,19 +359,6 @@ defmodule Archethic.BeaconChain.SubsetTest do
         enrollment_date: ~U[2020-09-01 00:00:00Z]
       })
 
-      P2P.add_and_connect_node(%Node{
-        ip: {127, 0, 0, 1},
-        port: 3000,
-        first_public_key: Crypto.first_node_public_key(),
-        last_public_key: Crypto.first_node_public_key(),
-        geo_patch: "AAA",
-        network_patch: "AAA",
-        available?: true,
-        authorized?: true,
-        authorization_date: ~U[2020-09-01 00:00:00Z],
-        enrollment_date: ~U[2020-09-01 00:00:00Z]
-      })
-
       tx_summary = %TransactionSummary{
         address: tx_address,
         timestamp: tx_time,
@@ -309,7 +369,8 @@ defmodule Archethic.BeaconChain.SubsetTest do
           <<0, 0, 8, 253, 201, 142, 182, 78, 169, 132, 29, 19, 74, 3, 142, 207, 219, 127, 147, 40,
             24, 44, 170, 214, 171, 224, 29, 177, 205, 226, 88, 62, 248, 84>>
         ],
-        fee: 0
+        fee: 0,
+        validation_stamp_checksum: :crypto.strong_rand_bytes(32)
       }
 
       send(
@@ -397,7 +458,8 @@ defmodule Archethic.BeaconChain.SubsetTest do
         <<0, 0, 8, 253, 201, 142, 182, 78, 169, 132, 29, 19, 74, 3, 142, 207, 219, 127, 147, 40,
           24, 44, 170, 214, 171, 224, 29, 177, 205, 226, 88, 62, 248, 84>>
       ],
-      fee: 0
+      fee: 0,
+      validation_stamp_checksum: :crypto.strong_rand_bytes(32)
     }
 
     tx_summary_payload = TransactionSummary.serialize(tx_summary)

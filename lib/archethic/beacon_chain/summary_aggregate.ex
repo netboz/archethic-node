@@ -9,7 +9,7 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
     :summary_time,
     availability_adding_time: [],
     version: 1,
-    transaction_summaries: [],
+    replication_attestations: [],
     p2p_availabilities: %{}
   ]
 
@@ -18,9 +18,9 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
   alias Archethic.BeaconChain.ReplicationAttestation
   alias Archethic.BeaconChain.Summary, as: BeaconSummary
 
-  alias Archethic.TransactionChain.TransactionSummary
-
   alias Archethic.Utils
+
+  require Logger
 
   @availability_adding_time :archethic
                             |> Application.compile_env!(Archethic.SelfRepair.Scheduler)
@@ -29,7 +29,7 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
   @type t :: %__MODULE__{
           version: non_neg_integer(),
           summary_time: DateTime.t(),
-          transaction_summaries: list(TransactionSummary.t()),
+          replication_attestations: list(ReplicationAttestation.t()),
           availability_adding_time: non_neg_integer() | list(non_neg_integer()),
           p2p_availabilities: %{
             (subset :: binary()) => %{
@@ -43,7 +43,7 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
   @doc """
   Aggregate a new BeaconChain's summary
   """
-  @spec add_summary(t(), BeaconSummary.t(), check_attestation :: boolean()) :: t()
+  @spec add_summary(t(), BeaconSummary.t()) :: t()
   def add_summary(
         agg = %__MODULE__{},
         %BeaconSummary{
@@ -53,63 +53,48 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
           node_average_availabilities: node_average_availabilities,
           end_of_node_synchronizations: end_of_node_synchronizations,
           availability_adding_time: availability_adding_time
-        },
-        check_attestation? \\ true
+        }
       ) do
-    valid_attestations? =
-      if check_attestation? do
-        Enum.all?(transaction_attestations, fn attestation ->
-          ReplicationAttestation.validate(attestation, false) == :ok
-        end)
-      else
-        true
-      end
+    agg =
+      Map.update!(
+        agg,
+        :replication_attestations,
+        fn prev ->
+          transaction_attestations
+          |> Enum.filter(&(ReplicationAttestation.validate(&1) == :ok))
+          |> Enum.concat(prev)
+        end
+      )
+      |> Map.update!(:availability_adding_time, &[availability_adding_time | &1])
 
-    if valid_attestations? do
-      agg =
-        Map.update!(
-          agg,
-          :transaction_summaries,
-          fn prev ->
-            transaction_attestations
-            |> Enum.map(& &1.transaction_summary)
-            |> Enum.concat(prev)
-            |> Enum.uniq_by(& &1.address)
-          end
-        )
-        |> Map.update!(:availability_adding_time, &[availability_adding_time | &1])
-
-      if bit_size(node_availabilities) > 0 or length(node_average_availabilities) > 0 or
-           length(end_of_node_synchronizations) > 0 do
-        update_in(
-          agg,
-          [
-            Access.key(:p2p_availabilities, %{}),
-            Access.key(subset, %{
-              node_availabilities: [],
-              node_average_availabilities: [],
-              end_of_node_synchronizations: []
-            })
-          ],
-          fn prev ->
-            prev
-            |> Map.update!(
-              :node_availabilities,
-              &Enum.concat(&1, [Utils.bitstring_to_integer_list(node_availabilities)])
-            )
-            |> Map.update!(
-              :node_average_availabilities,
-              &Enum.concat(&1, [node_average_availabilities])
-            )
-            |> Map.update!(
-              :end_of_node_synchronizations,
-              &Enum.concat(&1, end_of_node_synchronizations)
-            )
-          end
-        )
-      else
-        agg
-      end
+    if bit_size(node_availabilities) > 0 or length(node_average_availabilities) > 0 or
+         length(end_of_node_synchronizations) > 0 do
+      update_in(
+        agg,
+        [
+          Access.key(:p2p_availabilities, %{}),
+          Access.key(subset, %{
+            node_availabilities: [],
+            node_average_availabilities: [],
+            end_of_node_synchronizations: []
+          })
+        ],
+        fn prev ->
+          prev
+          |> Map.update!(
+            :node_availabilities,
+            &Enum.concat(&1, [Utils.bitstring_to_integer_list(node_availabilities)])
+          )
+          |> Map.update!(
+            :node_average_availabilities,
+            &Enum.concat(&1, [node_average_availabilities])
+          )
+          |> Map.update!(
+            :end_of_node_synchronizations,
+            &Enum.concat(&1, end_of_node_synchronizations)
+          )
+        end
+      )
     else
       agg
     end
@@ -119,12 +104,12 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
   Aggregate summaries batch
   """
   @spec aggregate(t()) :: t()
-  def aggregate(agg = %__MODULE__{}) do
+  def aggregate(agg) do
     agg
-    |> Map.update!(:transaction_summaries, fn transactions ->
-      transactions
-      |> Enum.uniq_by(& &1.address)
-      |> Enum.sort_by(& &1.timestamp, {:asc, DateTime})
+    |> Map.update!(:replication_attestations, fn attestations ->
+      attestations
+      |> ReplicationAttestation.reduce_confirmations()
+      |> Enum.sort_by(& &1.transaction_summary.timestamp, {:asc, DateTime})
     end)
     |> Map.update!(:availability_adding_time, fn
       [] ->
@@ -144,6 +129,33 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
       end)
       |> Enum.into(%{})
     end)
+  end
+
+  @doc """
+  Filter replication attestations list of a summary to keep only the one that reached the
+  minimum confirmations threshold and return the refused ones
+  """
+  @spec filter_reached_threshold(t()) :: {t(), list(ReplicationAttestation.t())}
+  def filter_reached_threshold(aggregate = %__MODULE__{replication_attestations: attestations}) do
+    %{accepted: accepted_attestations, refused: refused_attestations} =
+      Enum.reduce(
+        attestations,
+        %{accepted: [], refused: []},
+        fn attestation, acc ->
+          if ReplicationAttestation.reached_threshold?(attestation) do
+            # Confirmations reached threshold we accept the attestation in the summary
+            Map.update!(acc, :accepted, &[attestation | &1])
+          else
+            # Confirmations didn't reached threshold, we postpone attestation in next summary
+            Map.update!(acc, :refused, &[attestation | &1])
+          end
+        end
+      )
+      |> Map.update!(:accepted, &Enum.reverse/1)
+
+    filtered_aggregate = Map.put(aggregate, :replication_attestations, accepted_attestations)
+
+    {filtered_aggregate, refused_attestations}
   end
 
   defp aggregate_node_availabilities(node_availabilities) do
@@ -180,7 +192,7 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
   Determine when the aggregate is empty
   """
   @spec empty?(t()) :: boolean()
-  def empty?(%__MODULE__{transaction_summaries: [], p2p_availabilities: p2p_availabilities})
+  def empty?(%__MODULE__{replication_attestations: [], p2p_availabilities: p2p_availabilities})
       when map_size(p2p_availabilities) == 0,
       do: true
 
@@ -193,13 +205,26 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
 
     iex> %SummaryAggregate{
     ...>   summary_time: ~U[2022-03-01 00:00:00Z],
-    ...>   transaction_summaries: [
-    ...>     %TransactionSummary{
-    ...>       address: <<0, 0, 120, 123, 229, 13, 144, 130, 230, 18, 17, 45, 244, 92, 226, 107, 11, 104, 226,
-    ...>         249, 138, 85, 71, 127, 190, 20, 186, 69, 131, 97, 194, 30, 71, 116>>,
-    ...>       type: :transfer,
-    ...>       timestamp: ~U[2022-02-01 10:00:00.204Z],
-    ...>       fee: 10_000_000
+    ...>   replication_attestations: [
+    ...>     %ReplicationAttestation{
+    ...>      transaction_summary: %TransactionSummary{
+    ...>         address: <<0, 0, 120, 123, 229, 13, 144, 130, 230, 18, 17, 45, 244, 92, 226, 107, 11, 104, 226,
+    ...>           249, 138, 85, 71, 127, 190, 20, 186, 69, 131, 97, 194, 30, 71, 116>>,
+    ...>         type: :transfer,
+    ...>         timestamp: ~U[2022-02-01 10:00:00.204Z],
+    ...>         fee: 10_000_000,
+    ...>         validation_stamp_checksum: <<17, 8, 18, 246, 127, 161, 225, 240, 17, 127, 111, 61, 112, 36, 28, 26, 66,
+    ...>          167, 176, 119, 17, 169, 60, 36, 119, 204, 81, 109, 144, 66, 249, 219>>
+    ...>      },
+    ...>      confirmations: [
+    ...>        {
+    ...>          0,
+    ...>          <<129, 204, 107, 81, 235, 88, 234, 207, 125, 1, 208, 227, 239, 175, 78, 217,
+    ...>           100, 172, 67, 228, 131, 42, 177, 200, 54, 225, 34, 241, 35, 226, 108, 138,
+    ...>           201, 2, 32, 75, 92, 49, 194, 42, 113, 154, 20, 43, 216, 176, 11, 159, 188,
+    ...>           119, 6, 8, 48, 201, 244, 138, 99, 52, 22, 1, 97, 123, 140, 195>>
+    ...>        }
+    ...>      ]
     ...>     }
     ...>   ],
     ...>   p2p_availabilities: %{
@@ -219,8 +244,12 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
       1,
       # Summary time
       98, 29, 98, 0,
-      # Nb transaction summaries
+      # Nb replication attestations
       1, 1,
+      # Replication attestations version
+      1, 
+      # Transaction summary version
+      1,
       # Address
       0, 0, 120, 123, 229, 13, 144, 130, 230, 18, 17, 45, 244, 92, 226, 107, 11, 104, 226,
       249, 138, 85, 71, 127, 190, 20, 186, 69, 131, 97, 194, 30, 71, 116,
@@ -232,6 +261,20 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
       0, 0, 0, 0, 0, 152, 150, 128,
       # Nb movements addresses
       1, 0,
+      # Validation stamp checksum
+      17, 8, 18, 246, 127, 161, 225, 240, 17, 127, 111, 61, 112, 36, 28, 26, 66,
+      167, 176, 119, 17, 169, 60, 36, 119, 204, 81, 109, 144, 66, 249, 219,
+      # Nb confirmations
+      1,
+      # Replication node position
+      0,
+      # Signature size
+      64,
+      # Replication node signature
+      129, 204, 107, 81, 235, 88, 234, 207, 125, 1, 208, 227, 239, 175, 78, 217,
+      100, 172, 67, 228, 131, 42, 177, 200, 54, 225, 34, 241, 35, 226, 108, 138,
+      201, 2, 32, 75, 92, 49, 194, 42, 113, 154, 20, 43, 216, 176, 11, 159, 188,
+      119, 6, 8, 48, 201, 244, 138, 99, 52, 22, 1, 97, 123, 140, 195,
       # Nb of p2p availabilities subset
       1,
       # Subset
@@ -255,15 +298,15 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
   def serialize(%__MODULE__{
         version: version,
         summary_time: summary_time,
-        transaction_summaries: transaction_summaries,
+        replication_attestations: attestations,
         p2p_availabilities: p2p_availabilities,
         availability_adding_time: availability_adding_time
       }) do
-    nb_tx_summaries = Utils.VarInt.from_value(length(transaction_summaries))
+    nb_attestations = Utils.VarInt.from_value(length(attestations))
 
-    tx_summaries_bin =
-      transaction_summaries
-      |> Enum.map(&TransactionSummary.serialize/1)
+    attestations_bin =
+      attestations
+      |> Enum.map(&ReplicationAttestation.serialize/1)
       |> :erlang.list_to_binary()
 
     p2p_availabilities_bin =
@@ -290,8 +333,8 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
       end)
       |> :erlang.list_to_bitstring()
 
-    <<version::8, DateTime.to_unix(summary_time)::32, nb_tx_summaries::binary,
-      tx_summaries_bin::binary, map_size(p2p_availabilities)::8,
+    <<version::8, DateTime.to_unix(summary_time)::32, nb_attestations::binary,
+      attestations_bin::binary, map_size(p2p_availabilities)::8,
       p2p_availabilities_bin::bitstring, availability_adding_time::16>>
   end
 
@@ -300,44 +343,63 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
 
   ## Examples
 
-  iex> SummaryAggregate.deserialize(<<1, 98, 29, 98, 0, 1, 1, 0, 0, 120, 123, 229, 13, 144, 130, 230,
-  ...> 18, 17, 45, 244, 92, 226, 107, 11, 104, 226, 249, 138, 85, 71, 127, 190, 20, 186, 69, 131, 97,
-  ...> 194, 30, 71, 116, 0, 0, 1, 126, 180, 186, 17, 204, 253, 0, 0, 0, 0, 0, 152, 150, 128, 1, 0, 1,
-  ...> 0, 1, 3, 1::1, 0::1, 1::1, 50, 70, 80, 1, 1, 0, 1, 57, 98, 198, 202, 155, 43, 217, 149, 5, 213,
-  ...> 109, 252, 111, 87, 231, 170, 54, 211, 178, 208, 5, 184, 33, 193, 167, 91, 160, 131, 129, 117, 45, 242, 3, 132>>)
-  {
-    %SummaryAggregate{
-      summary_time: ~U[2022-03-01 00:00:00Z],
-      transaction_summaries: [
-        %TransactionSummary{
-          address: <<0, 0, 120, 123, 229, 13, 144, 130, 230, 18, 17, 45, 244, 92, 226, 107, 11, 104, 226,
-            249, 138, 85, 71, 127, 190, 20, 186, 69, 131, 97, 194, 30, 71, 116>>,
-          type: :transfer,
-          timestamp: ~U[2022-02-01 10:00:00.204Z],
-          fee: 10_000_000
-        }
-      ],
-      p2p_availabilities: %{
-        <<0>> => %{
-          node_availabilities: <<1::1, 0::1, 1::1>>,
-          node_average_availabilities: [0.5, 0.7, 0.8],
-          end_of_node_synchronizations: [
-             <<0, 1, 57, 98, 198, 202, 155, 43, 217, 149, 5, 213, 109, 252, 111, 87, 231, 170, 54,
-               211, 178, 208, 5, 184, 33, 193, 167, 91, 160, 131, 129, 117, 45, 242>>
+    iex> SummaryAggregate.deserialize(<<1, 98, 29, 98, 0, 1, 1, 1, 1, 0, 0, 120, 123, 229, 13, 144,
+    ...> 130, 230, 18, 17, 45, 244, 92, 226, 107, 11, 104, 226, 249, 138, 85, 71, 127, 190, 20, 186, 69,
+    ...> 131, 97, 194, 30, 71, 116, 0, 0, 1, 126, 180, 186, 17, 204, 253, 0, 0, 0, 0, 0, 152, 150, 128,
+    ...> 1, 0, 17, 8, 18, 246, 127, 161, 225, 240, 17, 127, 111, 61, 112, 36, 28, 26, 66,
+    ...> 167, 176, 119, 17, 169, 60, 36, 119, 204, 81, 109, 144, 66, 249, 219, 1, 0, 64,
+    ...> 129, 204, 107, 81, 235, 88, 234, 207, 125, 1, 208, 227, 239, 175, 78, 217,
+    ...> 100, 172, 67, 228, 131, 42, 177, 200, 54, 225, 34, 241, 35, 226, 108, 138,
+    ...> 201, 2, 32, 75, 92, 49, 194, 42, 113, 154, 20, 43, 216, 176, 11, 159, 188,
+    ...> 119, 6, 8, 48, 201, 244, 138, 99, 52, 22, 1, 97, 123, 140, 195, 1, 0, 1, 3, 1::1, 0::1, 1::1,
+    ...> 50, 70, 80, 1, 1, 0, 1, 57, 98, 198, 202, 155, 43, 217, 149, 5, 213, 109, 252, 111, 87, 231, 170, 54,
+    ...> 211, 178, 208, 5, 184, 33, 193, 167, 91, 160, 131, 129, 117, 45, 242, 3, 132>>)
+    {
+      %SummaryAggregate{
+       summary_time: ~U[2022-03-01 00:00:00Z],
+       replication_attestations: [
+         %ReplicationAttestation{
+          transaction_summary: %TransactionSummary{
+             address: <<0, 0, 120, 123, 229, 13, 144, 130, 230, 18, 17, 45, 244, 92, 226, 107, 11, 104, 226,
+               249, 138, 85, 71, 127, 190, 20, 186, 69, 131, 97, 194, 30, 71, 116>>,
+             type: :transfer,
+             timestamp: ~U[2022-02-01 10:00:00.204Z],
+             fee: 10_000_000,
+             validation_stamp_checksum: <<17, 8, 18, 246, 127, 161, 225, 240, 17, 127, 111, 61, 112, 36, 28, 26, 66,
+              167, 176, 119, 17, 169, 60, 36, 119, 204, 81, 109, 144, 66, 249, 219>>
+          },
+          confirmations: [
+            {
+              0,
+              <<129, 204, 107, 81, 235, 88, 234, 207, 125, 1, 208, 227, 239, 175, 78, 217,
+               100, 172, 67, 228, 131, 42, 177, 200, 54, 225, 34, 241, 35, 226, 108, 138,
+               201, 2, 32, 75, 92, 49, 194, 42, 113, 154, 20, 43, 216, 176, 11, 159, 188,
+               119, 6, 8, 48, 201, 244, 138, 99, 52, 22, 1, 97, 123, 140, 195>>
+            }
           ]
-        }
-      },
-      availability_adding_time: 900
-    },
-    ""
-  }
+         }
+       ],
+       p2p_availabilities: %{
+         <<0>> => %{
+           node_availabilities: <<1::1, 0::1, 1::1>>,
+           node_average_availabilities: [0.5, 0.7, 0.8],
+           end_of_node_synchronizations: [
+              <<0, 1, 57, 98, 198, 202, 155, 43, 217, 149, 5, 213, 109, 252, 111, 87, 231, 170, 54,
+                211, 178, 208, 5, 184, 33, 193, 167, 91, 160, 131, 129, 117, 45, 242>>
+           ]
+         }
+       },
+       availability_adding_time: 900
+     },
+      ""
+    }
   """
   @spec deserialize(bitstring()) :: {t(), bitstring()}
   def deserialize(<<1::8, timestamp::32, rest::bitstring>>) do
-    {nb_tx_summaries, rest} = Utils.VarInt.get_value(rest)
+    {nb_attestations, rest} = Utils.VarInt.get_value(rest)
 
-    {tx_summaries, <<nb_p2p_availabilities::8, rest::bitstring>>} =
-      Utils.deserialize_transaction_summaries(rest, nb_tx_summaries, [])
+    {attestations, <<nb_p2p_availabilities::8, rest::bitstring>>} =
+      Utils.deserialize_transaction_attestations(rest, nb_attestations, [])
 
     {p2p_availabilities, <<availability_adding_time::16, rest::bitstring>>} =
       deserialize_p2p_availabilities(rest, nb_p2p_availabilities, %{})
@@ -346,7 +408,7 @@ defmodule Archethic.BeaconChain.SummaryAggregate do
       %__MODULE__{
         version: 1,
         summary_time: DateTime.from_unix!(timestamp),
-        transaction_summaries: tx_summaries,
+        replication_attestations: attestations,
         p2p_availabilities: p2p_availabilities,
         availability_adding_time: availability_adding_time
       },

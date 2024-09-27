@@ -4,11 +4,11 @@ defmodule ArchethicWeb.Endpoint do
   use Phoenix.Endpoint, otp_app: :archethic
   use Absinthe.Phoenix.Endpoint
 
-  alias Archethic.Bootstrap
-
   require Logger
 
   plug(:archethic_up)
+
+  plug(ArchethicWeb.Plugs.RemoteIP)
 
   # The session will be stored in the cookie and signed,
   # this means its contents can be read but not tampered with.
@@ -62,7 +62,7 @@ defmodule ArchethicWeb.Endpoint do
   # ps: this handle only HTTP(S) requests
   #     for WS, see archethic_web/channels/user_socket.ex
   defp archethic_up(conn, _opts) do
-    if Bootstrap.done?() do
+    if Archethic.up?() do
       conn
     else
       Logger.debug("Received a web request but node is bootstraping")
